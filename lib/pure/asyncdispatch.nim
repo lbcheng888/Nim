@@ -266,8 +266,11 @@ proc processTimers(
 proc processPendingCallbacks(p: PDispatcherBase; didSomeWork: var bool) =
   while p.callbacks.len > 0:
     var cb = p.callbacks.popFirst()
-    cb()
     didSomeWork = true
+    try:
+      cb()
+    finally:
+      cb = nil
 
 proc adjustTimeout(
   p: PDispatcherBase, pollTimeout: int, nextTimer: Option[int]
