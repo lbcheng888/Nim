@@ -61,6 +61,8 @@ proc semTypeOf(c: PContext; n: PNode): PNode
 proc computeRequiresInit(c: PContext, t: PType): bool
 proc defaultConstructionError(c: PContext, t: PType, info: TLineInfo)
 proc hasUnresolvedArgs(c: PContext, n: PNode): bool
+proc isImportSystemStmt(g: ModuleGraph; n: PNode): bool
+proc isEmptyTree(n: PNode): bool
 proc isArrayConstr(n: PNode): bool {.inline.} =
   result = n.kind == nkBracket and
     n.typ.skipTypes(abstractInst).kind == tyArray
@@ -102,7 +104,7 @@ proc fitNode(c: PContext, formal: PType, arg: PNode; info: TLineInfo): PNode =
                renderTree(arg, {renderNoComments}))
     # error correction:
     result = copyTree(arg)
-    result.typ() = formal
+    result.typ = formal
   elif arg.kind in nkSymChoices and formal.skipTypes(abstractInst).kind == tyEnum:
     # Pick the right 'sym' from the sym choice by looking at 'formal' type:
     result = nil
@@ -116,7 +118,7 @@ proc fitNode(c: PContext, formal: PType, arg: PNode; info: TLineInfo): PNode =
       typeMismatch(c.config, info, formal, arg.typ, arg)
       # error correction:
       result = copyTree(arg)
-      result.typ() = formal
+      result.typ = formal
     else:
       result = fitNodePostMatch(c, formal, result)
 
@@ -126,7 +128,7 @@ proc fitNodeConsiderViewType(c: PContext, formal: PType, arg: PNode; info: TLine
     #classifyViewType(formal) != noView:
     result = newNodeIT(nkHiddenAddr, a.info, formal)
     result.add a
-    formal.flags.incl tfVarIsPtr
+    formal.incl tfVarIsPtr
   else:
    result = a
 
@@ -260,7 +262,7 @@ proc newSymG*(kind: TSymKind, n: PNode, c: PContext): PSym =
   else:
     result = newSym(kind, considerQuotedIdent(c, n), c.idgen, getCurrOwner(c), n.info)
     if find(result.name.s, '`') >= 0:
-      result.flags.incl sfWasGenSym
+      result.flagsImpl.incl sfWasGenSym
   #if kind in {skForVar, skLet, skVar} and result.owner.kind == skModule:
   #  incl(result.flags, sfGlobal)
   when defined(nimsuggest):
@@ -346,6 +348,19 @@ proc fixupTypeAfterEval(c: PContext, evaluated, eOrig: PNode; producedClosure: v
          isArrayConstr(arg):
         arg.typ = eOrig.typ
 
+proc resetEvalPosition(n: PNode) =
+  # resets the eval position of variables because `tryConstExpr` may be
+  # called multiple times on the same node
+  case n.kind
+  of {nkNone..nkNilLit}-{nkSym}:
+    discard
+  of nkSym:
+    if n.sym.kind in {skVar, skLet} and sfGlobal notin n.sym.flags:
+      n.sym.position = 0
+  else:
+    for i in 0..<n.safeLen:
+      resetEvalPosition(n[i])
+
 proc tryConstExpr(c: PContext, n: PNode; expectedType: PType = nil): PNode =
   var e = semExprWithType(c, n, expectedType = expectedType)
   if e == nil: return
@@ -381,6 +396,8 @@ proc tryConstExpr(c: PContext, n: PNode; expectedType: PType = nil): PNode =
   when defined(nimsuggest):
     # Restore the error hook
     c.graph.config.structuredErrorHook = tempHook
+
+  resetEvalPosition(n)
 
   c.config.errorCounter = oldErrorCount
   c.config.errorMax = oldErrorMax
@@ -476,7 +493,7 @@ proc semAfterMacroCall(c: PContext, call, macroResult: PNode,
                    renderTree(result, {renderNoComments}))
         result = newSymNode(errorSym(c, result))
       else:
-        result.typ() = makeTypeDesc(c, typ)
+        result.typ = makeTypeDesc(c, typ)
       #result = symNodeFromType(c, typ, n.info)
     else:
       if s.ast[genericParamsPos] != nil and retType.isMetaType:
@@ -635,7 +652,7 @@ proc defaultFieldsForTuple(c: PContext, recNode: PNode, hasDefault: var bool, ch
                       newNodeIT(nkType, recNode.info, asgnType)
                     )
       asgnExpr.flags.incl nfSkipFieldChecking
-      asgnExpr.typ() = recNode.typ
+      asgnExpr.typ = recNode.typ
       result.add newTree(nkExprColonExpr, recNode, asgnExpr)
   else:
     raiseAssert "unreachable"
@@ -657,7 +674,7 @@ proc defaultFieldsForTheUninitialized(c: PContext, recNode: PNode, checkDefault:
       if checkDefault: # don't add defaults when checking whether a case branch has default fields
         return
       defaultValue = newIntNode(nkIntLit#[c.graph]#, 0)
-      defaultValue.typ() = discriminator.typ
+      defaultValue.typ = discriminator.typ
     selectedBranch = recNode.pickCaseBranchIndex defaultValue
     defaultValue.flags.incl nfSkipFieldChecking
     result.add newTree(nkExprColonExpr, discriminator, defaultValue)
@@ -670,7 +687,7 @@ proc defaultFieldsForTheUninitialized(c: PContext, recNode: PNode, checkDefault:
     elif recType.kind in {tyObject, tyArray, tyTuple}:
       let asgnExpr = defaultNodeField(c, recNode, recNode.typ, checkDefault)
       if asgnExpr != nil:
-        asgnExpr.typ() = recNode.typ
+        asgnExpr.typ = recNode.typ
         asgnExpr.flags.incl nfSkipFieldChecking
         result.add newTree(nkExprColonExpr, recNode, asgnExpr)
   else:
@@ -683,7 +700,7 @@ proc defaultNodeField(c: PContext, a: PNode, aTyp: PType, checkDefault: bool): P
     let child = defaultFieldsForTheUninitialized(c, aTypSkip.n, checkDefault)
     if child.len > 0:
       var asgnExpr = newTree(nkObjConstr, newNodeIT(nkType, a.info, aTyp))
-      asgnExpr.typ() = aTyp
+      asgnExpr.typ = aTyp
       asgnExpr.sons.add child
       result = semExpr(c, asgnExpr)
     else:
@@ -695,11 +712,11 @@ proc defaultNodeField(c: PContext, a: PNode, aTyp: PType, checkDefault: bool): P
       let node = newNode(nkIntLit)
       node.intVal = toInt64(lengthOrd(c.graph.config, aTypSkip))
       let typeNode = newNode(nkType)
-      typeNode.typ() = makeTypeDesc(c, aTypSkip[1])
+      typeNode.typ = makeTypeDesc(c, aTypSkip[1])
       result = semExpr(c, newTree(nkCall, newTree(nkBracketExpr, newSymNode(getSysSym(c.graph, a.info, "arrayWithDefault"), a.info), typeNode),
               node
                 ))
-      result.typ() = aTyp
+      result.typ = aTyp
     else:
       result = nil
   of tyTuple:
@@ -708,7 +725,7 @@ proc defaultNodeField(c: PContext, a: PNode, aTyp: PType, checkDefault: bool): P
       let children = defaultFieldsForTuple(c, aTypSkip.n, hasDefault, checkDefault)
       if hasDefault and children.len > 0:
         result = newNodeI(nkTupleConstr, a.info)
-        result.typ() = aTyp
+        result.typ = aTyp
         result.sons.add children
         result = semExpr(c, result)
       else:
@@ -737,6 +754,24 @@ proc addCodeForGenerics(c: PContext, n: PNode) =
       else:
         n.add prc.ast
   c.lastGenericIdx = c.generics.len
+
+proc preloadForwardDecls(c: PContext) =
+  for s in semtabAll(c.graph, c.module).data:
+    if s != nil and sfForward in s.flags:
+      if s.kind in OverloadableSyms:
+        addOverloadableSymAt(c, c.currentScope, s)
+      else:
+        addDeclAt(c, c.currentScope, s)
+
+proc ensureTopLevelSystemImport(c: PContext; n: PNode) =
+  if c.topStmts == 0 and not isImportSystemStmt(c.graph, n):
+    if sfSystemModule notin c.module.flags and not isEmptyTree(n):
+      assert c.graph.systemModule != nil
+      c.moduleScope.addSym c.graph.systemModule
+      importAllSymbols(c, c.graph.systemModule)
+      inc c.topStmts
+  else:
+    inc c.topStmts
 
 proc preparePContext*(graph: ModuleGraph; module: PSym; idgen: IdGenerator): PContext =
   result = newContext(graph, module)
@@ -773,6 +808,169 @@ proc preparePContext*(graph: ModuleGraph; module: PSym; idgen: IdGenerator): PCo
   if sfSystemModule in module.flags:
     graph.systemModule = module
   result.topLevelScope = openScope(result)
+  preloadForwardDecls(result)
+
+proc discardPContext*(c: PContext) =
+  rawCloseScope(c)
+  rawCloseScope(c)
+  popOwner(c)
+  popProcCon(c)
+
+proc semCallableHeader(c: PContext; n: PNode) =
+  var header = copyTree(n)
+  if bodyPos < header.len:
+    header[bodyPos] = newNodeI(nkEmpty, n.info)
+  case header.kind
+  of nkProcDef: discard semProc(c, header)
+  of nkFuncDef: discard semFunc(c, header)
+  of nkMethodDef: discard semMethod(c, header)
+  of nkIteratorDef: discard semIterator(c, header)
+  of nkConverterDef: discard semConverterDef(c, header)
+  of nkMacroDef: discard semMacroDef(c, header)
+  of nkTemplateDef: discard semTemplateDef(c, header)
+  else: discard
+  if namePos < header.len and header[namePos].kind == nkSym:
+    let s = header[namePos].sym
+    if s != nil and s.kind in {skProc, skFunc, skMethod, skIterator, skConverter} and sfForward in s.flags:
+      c.graph.interfaceCallableStubs.incl s.id
+
+proc isExportedCallableHeader(n: PNode): bool =
+  if namePos >= n.len:
+    return false
+  var name = n[namePos]
+  if name.kind == nkPragmaExpr:
+    name = name[0]
+  result = name.kind == nkPostfix
+
+proc collectTypeNames(c: PContext; n: PNode) =
+  case n.kind
+  of nkIncludeStmt:
+    for i in 0..<n.len:
+      let f = checkModuleName(c.config, n[i])
+      if f != InvalidFileIdx:
+        if containsOrIncl(c.includedFiles, f.int):
+          localError(c.config, n.info, errRecursiveDependencyX % toMsgFilename(c.config, f))
+        else:
+          let code = c.graph.includeFileCallback(c.graph, c.module, f)
+          collectTypeNames(c, code)
+          excl(c.includedFiles, f.int)
+  of nkStmtList:
+    for i in 0..<n.len:
+      collectTypeNames(c, n[i])
+  of nkWhenStmt:
+    if sfSystemModule notin c.module.flags and not belongsToStdlib(c.graph, c.module):
+      collectTypeNames(c, semWhen(c, n, semCheck = false))
+  of nkTypeSection:
+    incl n.flags, nfSem
+    inc c.inTypeContext
+    typeSectionLeftSidePass(c, n)
+    dec c.inTypeContext
+  else:
+    discard
+
+proc collectImports(c: PContext; n: PNode) =
+  case n.kind
+  of nkIncludeStmt:
+    for i in 0..<n.len:
+      let f = checkModuleName(c.config, n[i])
+      if f != InvalidFileIdx:
+        if containsOrIncl(c.includedFiles, f.int):
+          localError(c.config, n.info, errRecursiveDependencyX % toMsgFilename(c.config, f))
+        else:
+          let code = c.graph.includeFileCallback(c.graph, c.module, f)
+          collectImports(c, code)
+          excl(c.includedFiles, f.int)
+  of nkStmtList:
+    for i in 0..<n.len:
+      collectImports(c, n[i])
+  of nkWhenStmt:
+    if sfSystemModule notin c.module.flags and not belongsToStdlib(c.graph, c.module):
+      collectImports(c, semWhen(c, n, semCheck = false))
+  of nkImportStmt, nkFromStmt, nkImportExceptStmt:
+    discard semStmt(c, n, {})
+  else:
+    discard
+
+proc checkSelfImports(c: PContext; n: PNode) =
+  proc checkModuleNode(n: PNode) =
+    var n = n
+    if n.kind == nkPragmaExpr:
+      n = n[0]
+    if n.kind == nkInfix and n.len == 3 and n[0].kind == nkIdent and n[0].ident.s == "as":
+      n = n[1]
+    let f = checkModuleName(c.config, n, false)
+    if f != InvalidFileIdx and f == c.module.fileIdx:
+      localError(c.config, n.info, "module '$1' cannot import itself" % c.module.name.s)
+
+  case n.kind
+  of nkIncludeStmt:
+    for i in 0..<n.len:
+      let f = checkModuleName(c.config, n[i])
+      if f != InvalidFileIdx:
+        if containsOrIncl(c.includedFiles, f.int):
+          localError(c.config, n.info, errRecursiveDependencyX % toMsgFilename(c.config, f))
+        else:
+          let code = c.graph.includeFileCallback(c.graph, c.module, f)
+          checkSelfImports(c, code)
+          excl(c.includedFiles, f.int)
+  of nkStmtList:
+    for i in 0..<n.len:
+      checkSelfImports(c, n[i])
+  of nkWhenStmt:
+    if sfSystemModule notin c.module.flags and not belongsToStdlib(c.graph, c.module):
+      checkSelfImports(c, semWhen(c, n, semCheck = false))
+  of nkImportStmt:
+    for it in n:
+      if it.kind in {nkInfix, nkPrefix} and it[^1].kind == nkBracket:
+        let lastPos = it.len - 1
+        var imp = copyNode(it)
+        newSons(imp, it.len)
+        for i in 0..<lastPos:
+          imp[i] = it[i]
+        imp[lastPos] = imp[0]
+        for x in it[lastPos]:
+          if x.kind == nkInfix and x.len == 3 and x[0].kind == nkIdent and x[0].ident.s == "as":
+            imp[lastPos] = x[1]
+          else:
+            imp[lastPos] = x
+          checkModuleNode(imp)
+      else:
+        checkModuleNode(it)
+  of nkImportExceptStmt, nkFromStmt:
+    checkModuleNode(n[0])
+  else:
+    discard
+
+proc collectCallableHeaders(c: PContext; n: PNode) =
+  case n.kind
+  of nkIncludeStmt:
+    for i in 0..<n.len:
+      let f = checkModuleName(c.config, n[i])
+      if f != InvalidFileIdx:
+        if containsOrIncl(c.includedFiles, f.int):
+          localError(c.config, n.info, errRecursiveDependencyX % toMsgFilename(c.config, f))
+        else:
+          let code = c.graph.includeFileCallback(c.graph, c.module, f)
+          collectCallableHeaders(c, code)
+          excl(c.includedFiles, f.int)
+  of nkStmtList:
+    for i in 0..<n.len:
+      collectCallableHeaders(c, n[i])
+  of nkWhenStmt:
+    if sfSystemModule notin c.module.flags and not belongsToStdlib(c.graph, c.module):
+      collectCallableHeaders(c, semWhen(c, n, semCheck = false))
+  of procDefs:
+    if isExportedCallableHeader(n):
+      semCallableHeader(c, n)
+  else:
+    discard
+
+proc collectInterfaceWithPContext*(c: PContext; n: PNode) =
+  checkSelfImports(c, n)
+  ensureTopLevelSystemImport(c, n)
+  collectTypeNames(c, n)
+  collectImports(c, n)
+  collectCallableHeaders(c, n)
 
 proc isImportSystemStmt(g: ModuleGraph; n: PNode): bool =
   if g.systemModule == nil: return false
@@ -808,14 +1006,7 @@ proc isEmptyTree(n: PNode): bool =
   else: result = false
 
 proc semStmtAndGenerateGenerics(c: PContext, n: PNode): PNode =
-  if c.topStmts == 0 and not isImportSystemStmt(c.graph, n):
-    if sfSystemModule notin c.module.flags and not isEmptyTree(n):
-      assert c.graph.systemModule != nil
-      c.moduleScope.addSym c.graph.systemModule # import the "System" identifier
-      importAllSymbols(c, c.graph.systemModule)
-      inc c.topStmts
-  else:
-    inc c.topStmts
+  ensureTopLevelSystemImport(c, n)
   if sfNoForward in c.module.flags:
     result = semAllTypeSections(c, n)
   else:
@@ -840,7 +1031,7 @@ proc semStmtAndGenerateGenerics(c: PContext, n: PNode): PNode =
     appendToModule(c.module, result)
   trackStmt(c, c.module, result, isTopLevel = true)
   if optMultiMethods notin c.config.globalOptions and
-      c.config.selectedGC in {gcArc, gcOrc, gcAtomicArc} and
+      c.config.selectedGC in {gcArc, gcOrc, gcAtomicArc, gcYrc} and
       Feature.vtables in c.config.features:
     sortVTableDispatchers(c.graph)
 
@@ -874,8 +1065,6 @@ proc semWithPContext*(c: PContext, n: PNode): PNode =
       else:
         result = newNodeI(nkEmpty, n.info)
       #if c.config.cmd == cmdIdeTools: findSuggest(c, n)
-  storeRodNode(c, result)
-
 
 proc reportUnusedModules(c: PContext) =
   if c.config.cmd == cmdM: return

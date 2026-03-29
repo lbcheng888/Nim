@@ -1144,6 +1144,8 @@ semantic analysis). Assignments from the base type to one of its subrange types
 A subrange type has the same size as its base type (`int` in the
 Subrange example).
 
+Implicit "downsizing" conversions to range types (for example, `int -> range[0..255]` or `range[1..256] -> range[0..255]`) emit the `ImplicitRangeConversion` warning. Conversions that are clearly safe (for example, `range[0..255] -> range[0..65535]`) and any explicit casts do not trigger this warning. Conversions from `int` to common subranges such as `Natural` or `Positive` do not trigger this warning by default, but can be enabled with `--warning:systemRangeConversion`.
+
 
 Pre-defined floating-point types
 --------------------------------
@@ -3008,6 +3010,12 @@ is more specific
 2. if the concept is being compared with another concept the result is deferred to [Concept subset matching]
 3. in any other case the concept is less specific then it's competitor 
 
+Currently, the concept evaluation mechanism evaluates to a successful match on the first acceptable candidate
+for each defined binding. This has a couple of notable effects:
+
+- generic parameters are fulfilled by the first candidate match even if other candidates would also match and bind different parameters
+- inheritable objects match as they do in normal overload resolution except the "depth" is not accounted for, because that would require calculating the minimum depth of any matching binding
+
 
 Concept subset matching
 -------------------------
@@ -3018,6 +3026,44 @@ are also valid implementations of `C2` but not vice versa then `C1` is a subset 
 If neither of them are subsets of one another, then the disambiguation proceeds to complexity analysis
 and the concept with the most definitions wins, if any. No definite winner is an ambiguity error at
 compile time.
+
+Recursive concepts
+------------------
+
+Concepts can reference themselves in their definitions, enabling recursive type constraints.
+This is useful for matching `distinct` types that should inherit traits from their base type:
+
+```nim
+import std/typetraits
+
+type
+  PrimitiveBase = SomeNumber | bool | ptr | pointer | enum
+
+  # Matches PrimitiveBase directly, or any distinct type whose base is Primitive
+  Primitive = concept x
+    x is PrimitiveBase or distinctBase(x) is Primitive
+
+  # Application: a handle type that should be treated like a primitive
+  Handle = distinct int
+  SpecialHandle = distinct Handle
+
+assert int is Primitive
+assert Handle is Primitive
+assert SpecialHandle is Primitive  # works through 2 levels
+assert not (string is Primitive)
+```
+
+Concepts can also be mutually recursive (co-dependent):
+
+```nim
+type
+  Serializable = concept
+    proc serialize(s: Self; writer: var Writer)
+  Writer = concept
+    proc write(w: var Self; data: Serializable)
+```
+
+The compiler uses cycle detection to handle these cases without infinite recursion.
 
 Statements and expressions
 ==========================
@@ -7860,7 +7906,7 @@ alignment requirement of the type are ignored.
   main()
   ```
 
-This pragma has no effect on the JS backend.
+This pragma has no effect on the JavaScript backend and may significantly increase memory usage with the `--mm:refc` option.
 
 
 Noalias pragma
@@ -7935,6 +7981,35 @@ underlying C `struct`:c: in a `sizeof` expression:
     DIR* {.importc: "DIR", header: "<dirent.h>",
            pure, incompleteStruct.} = object
   ```
+
+
+CompleteStruct pragma
+---------------------
+The `completeStruct` pragma is a contract indicating that an `importc` type
+declaration contains all fields of the corresponding C type, allowing
+`sizeof`, `alignof`, and `offsetof` to be computed at compile-time.
+
+By default, `importc` types are assumed to be incomplete (their size is
+unknown at compile-time). Use `completeStruct` when you need compile-time
+size information and can guarantee the Nim definition matches the C layout:
+
+  ```Nim
+  type
+    InotifyEvent {.importc: "struct inotify_event", header: "<sys/inotify.h>",
+                   completeStruct.} = object
+      wd: cint
+      mask: uint32
+      cookie: uint32
+      len: uint32
+      # All fields must match the C struct exactly
+  ```
+
+If the Nim fields don't match the C struct, a static assertion will fail
+during C code generation.
+
+Without `completeStruct`, attempting to use `sizeof` on an `importc` type
+at compile-time will error with "'sizeof' requires '.importc' types to be
+'.completeStruct'".
 
 
 Compile pragma
