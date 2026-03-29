@@ -18,6 +18,7 @@ when not defined(leanCompiler):
 
 import std/[syncio, objectdollar, assertions, tables, strutils, strtabs]
 import renderer
+import ic/replayer
 
 proc setPipeLinePass*(graph: ModuleGraph; pass: PipelinePass) =
   graph.pipelinePass = pass
