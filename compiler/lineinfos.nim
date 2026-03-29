@@ -327,7 +327,8 @@ type
   ERecoverableError* = object of ValueError
   ESuggestDone* = object of ValueError
 
-proc `==`*(a, b: FileIndex): bool {.borrow.}
+proc `==`*(a, b: FileIndex): bool {.inline.} =
+  int32(a) == int32(b)
 
 proc hash*(i: TLineInfo): Hash =
   hash (i.line.int, i.col.int, i.fileIndex.int)

@@ -24,9 +24,10 @@ proc undefSymbol*(symbols: StringTableRef; symbol: string) =
 #proc lookupSymbol*(symbols: StringTableRef; symbol: string): string =
 #  result = if isDefined(symbol): gSymbols[symbol] else: nil
 
-iterator definedSymbolNames*(symbols: StringTableRef): string =
+proc definedSymbolNames*(symbols: StringTableRef): seq[string] =
+  result = newSeqOfCap[string](symbols.len)
   for key in keys(symbols):
-    yield key
+    result.add key
 
 proc countDefinedSymbols*(symbols: StringTableRef): int =
   symbols.len
@@ -176,4 +177,3 @@ proc initDefines*(symbols: StringTableRef) =
   defineSymbol("nimHasPreviewDuplicateModuleError")
 
   defineSymbol("nimHasImplicitRangeConversion")
-

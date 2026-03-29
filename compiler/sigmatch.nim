@@ -2851,7 +2851,7 @@ proc matchesAux(c: PContext, n, nOrig: PNode, m: var TCandidate, marker: var Int
         else: 0 # iterates over formal parameters
     arg: PNode = nil # current prepared argument
     formalLen = m.callee.n.len
-    formal = if formalLen > 1: m.callee.n[1].sym else: nil # current routine parameter
+    formal = if formalLen > f: m.callee.n[f].sym else: nil # current routine parameter
     container: PNode = nil # constructed container
   let firstArgBlock = findFirstArgBlock(m, n)
   while a < n.len:
@@ -3051,7 +3051,9 @@ proc matches*(c: PContext, n, nOrig: PNode, m: var TCandidate) =
   matchesAux(c, n, nOrig, m, marker)
   if m.state == csNoMatch: return
   # check that every formal parameter got a value:
-  for f in 1..<m.callee.n.len:
+  let formalStart = if m.callee.kind == tyGenericBody: 0 else: 1
+  let formalEnd = if m.callee.kind == tyGenericBody: m.callee.n.len - 1 else: m.callee.n.len
+  for f in formalStart..<formalEnd:
     let formal = m.callee.n[f].sym
     if not containsOrIncl(marker, formal.position):
       if formal.ast == nil:

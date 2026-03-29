@@ -66,10 +66,8 @@ _nimNumCpu(){
 }
 
 _nimBuildCsourcesIfNeeded(){
-  # if some systems cannot use make or gmake, we could add support for calling `build.sh`
-  # but this is slower (not parallel jobs) and would require making build.sh
-  # understand the arguments passed to the makefile (e.g. `CC=gcc ucpu=amd64 uos=darwin`),
-  # instead of `--cpu amd64 --os darwin`.
+  # Prefer the generated makefile for speed and compatibility with existing callers.
+  # Fall back to build.sh when a csources checkout is missing the makefile.
   unamestr=$(uname)
   # uname values: https://en.wikipedia.org/wiki/Uname
   if [ "$unamestr" = 'FreeBSD' ]; then
@@ -86,9 +84,86 @@ _nimBuildCsourcesIfNeeded(){
     makeX=make
   fi
   nCPU=$(_nimNumCpu)
-  echo_run which $makeX
-  # parallel jobs (5X faster on 16 cores: 10s instead of 50s)
-  echo_run $makeX -C $nim_csourcesDir -j $((nCPU + 2)) -l $nCPU "$@"
+  if test -f "$nim_csourcesDir/makefile"; then
+    echo_run which $makeX
+    # parallel jobs (5X faster on 16 cores: 10s instead of 50s)
+    echo_run $makeX -C $nim_csourcesDir -j $((nCPU + 2)) -l $nCPU "$@"
+  elif test -f "$nim_csourcesDir/build.sh"; then
+    echo "$nim_csourcesDir/makefile missing; falling back to build.sh"
+
+    # build.sh accepts a smaller argument surface than the makefile path.
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        CC=*)
+          buildShCC=${1#CC=}
+          ;;
+        CFLAGS=*)
+          buildShCFlags=${1#CFLAGS=}
+          ;;
+        CPPFLAGS=*)
+          buildShCppFlags=${1#CPPFLAGS=}
+          ;;
+        LDFLAGS=*)
+          buildShLdFlags=${1#LDFLAGS=}
+          ;;
+        ucpu=*)
+          buildShCpu=${1#ucpu=}
+          ;;
+        uos=*)
+          buildShOs=${1#uos=}
+          ;;
+        uosname=*)
+          buildShOsName=${1#uosname=}
+          ;;
+        *)
+          echo "Error: unsupported csources_v3 build.sh fallback argument: $1" >&2
+          return 1
+          ;;
+      esac
+      shift
+    done
+
+    (
+      set -e
+      cd "$nim_csourcesDir"
+
+      if [ "${buildShCC+set}" = set ]; then
+        CC=$buildShCC
+        export CC
+      fi
+      if [ "${buildShCFlags+set}" = set ]; then
+        CFLAGS=$buildShCFlags
+        export CFLAGS
+      fi
+      if [ "${buildShCppFlags+set}" = set ]; then
+        CPPFLAGS=$buildShCppFlags
+        export CPPFLAGS
+      fi
+      if [ "${buildShLdFlags+set}" = set ]; then
+        LDFLAGS=$buildShLdFlags
+        export LDFLAGS
+      fi
+
+      set --
+      if command -v sem >/dev/null 2>&1; then
+        set -- "$@" --parallel "$nCPU"
+      fi
+      if [ "${buildShOs+set}" = set ]; then
+        set -- "$@" --os "$buildShOs"
+      fi
+      if [ "${buildShCpu+set}" = set ]; then
+        set -- "$@" --cpu "$buildShCpu"
+      fi
+      if [ "${buildShOsName+set}" = set ]; then
+        set -- "$@" --osname "$buildShOsName"
+      fi
+
+      echo_run sh build.sh "$@"
+    )
+  else
+    echo "Error: missing both $nim_csourcesDir/makefile and $nim_csourcesDir/build.sh" >&2
+    return 1
+  fi
   # keep $nim_csources in case needed to investigate bootstrap issues
   # without having to rebuild
   echo_run cp bin/nim $nim_csources
